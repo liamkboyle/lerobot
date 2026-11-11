@@ -14,8 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import shutil
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -35,8 +37,47 @@ from lerobot.processor import (
     make_policy_processor_pipelines,
 )
 from lerobot.utils.constants import OBS_STATE
+from lerobot.utils.import_utils import require_package
 
 from .configuration_pi05 import PI05Config
+
+
+@ProcessorStepRegistry.register(name="pi05_sentencepiece_tokenizer")
+@dataclass
+class Pi05SentencePieceTokenizerProcessorStep(TokenizerProcessorStep):
+    """OpenPI's native PaliGemma SentencePiece tokenizer, loaded from a local ``.model`` file.
+
+    Needed to load checkpoints whose saved preprocessor references ``pi05_sentencepiece_tokenizer``
+    (e.g. ``hqfang/pi05-so100_101``).
+    """
+
+    def __post_init__(self):
+        require_package("sentencepiece", extra="pi")
+        import sentencepiece
+
+        if not self.tokenizer_name or self.padding_side != "right" or self.padding != "max_length":
+            raise ValueError("OpenPI tokenization requires a local model and right max_length padding")
+        self.input_tokenizer = sentencepiece.SentencePieceProcessor(model_file=self.tokenizer_name)
+
+    def _tokenize_text(self, text: str | list[str]) -> dict[str, torch.Tensor]:
+        texts = [text] if isinstance(text, str) else text
+        ids = torch.zeros(len(texts), self.max_length, dtype=torch.long)
+        mask = torch.zeros_like(ids, dtype=torch.bool)
+        for i, prompt in enumerate(texts):
+            tokens = self.input_tokenizer.encode(prompt, add_bos=True)
+            if len(tokens) > self.max_length and not self.truncation:
+                raise ValueError("Prompt exceeds maximum token length")
+            tokens = tokens[: self.max_length]
+            ids[i, : len(tokens)] = torch.tensor(tokens)
+            mask[i, : len(tokens)] = True
+        return {"input_ids": ids, "attention_mask": mask}
+
+    def save_artifacts(self, save_directory: Path) -> dict[str, str]:
+        target = Path(save_directory) / "tokenizer/tokenizer.model"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if Path(self.tokenizer_name).resolve() != target.resolve():
+            shutil.copy2(self.tokenizer_name, target)
+        return {"tokenizer_name": "tokenizer/tokenizer.model"}
 
 
 @ProcessorStepRegistry.register(name="pi05_prepare_state_tokenizer_processor_step")

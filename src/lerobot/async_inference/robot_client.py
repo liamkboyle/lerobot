@@ -29,7 +29,8 @@ python src/lerobot/async_inference/robot_client.py \
     --actions_per_chunk=50 \
     --chunk_size_threshold=0.5 \
     --aggregate_fn_name=weighted_average \
-    --debug_visualize_queue_size=True
+    --debug_visualize_queue_size=True \
+    --display_data=true
 ```
 """
 
@@ -77,6 +78,11 @@ from lerobot.transport import (
 )
 from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
 from lerobot.utils.import_utils import register_third_party_plugins
+from lerobot.utils.visualization_utils import (
+    init_visualization,
+    log_visualization_data,
+    shutdown_visualization,
+)
 
 from .configs import RobotClientConfig
 from .helpers import (
@@ -479,13 +485,28 @@ class RobotClient:
 
         while self.running:
             control_loop_start = time.perf_counter()
+            _new_action = None
+            _new_observation = None
+
             """Control loop: (1) Performing actions, when available"""
             if self.actions_available():
-                _performed_action = self.control_loop_action(verbose)
+                _performed_action = _new_action = self.control_loop_action(verbose)
 
             """Control loop: (2) Streaming observations to the remote policy server"""
             if self._ready_to_send_observation():
-                _captured_observation = self.control_loop_observation(task, verbose)
+                _captured_observation = _new_observation = self.control_loop_observation(task, verbose)
+
+            """Control loop: (3) Displaying what was just captured and performed"""
+            # Only this iteration's data: observations are captured on a slower cadence than the
+            # control loop, so re-logging the carried-over frame would fill the viewer with
+            # duplicates.
+            if self.config.display_data and (_new_observation is not None or _new_action is not None):
+                log_visualization_data(
+                    self.config.display_mode,
+                    observation=_new_observation,
+                    action=_new_action,
+                    compress_images=self.config.display_compressed_images,
+                )
 
             self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")
             # Dynamically adjust sleep time to maintain the desired control frequency
@@ -501,6 +522,11 @@ def async_client(cfg: RobotClientConfig):
     # TODO: Assert if checking robot support is still needed with the plugin system
     # if cfg.robot.type not in SUPPORTED_ROBOTS:
     #     raise ValueError(f"Robot {cfg.robot.type} not yet supported!")
+
+    if cfg.display_data:
+        init_visualization(
+            cfg.display_mode, session_name="async_inference", ip=cfg.display_ip, port=cfg.display_port
+        )
 
     client = RobotClient(cfg)
 
@@ -520,6 +546,8 @@ def async_client(cfg: RobotClientConfig):
         finally:
             client.stop()
             action_receiver_thread.join()
+            if cfg.display_data:
+                shutdown_visualization(cfg.display_mode)
             if cfg.debug_visualize_queue_size:
                 visualize_action_queue_size(client.action_queue_size)
             client.logger.info("Client stopped")

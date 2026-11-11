@@ -24,6 +24,7 @@ python -m lerobot.async_inference.policy_server \
 ```
 """
 
+import gc
 import logging
 import pickle  # nosec
 import threading
@@ -88,6 +89,14 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
         self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
 
+        # Identity of the weights currently resident on the device, so a reconnecting client
+        # reuses them instead of paying the load cost again. The lock serialises concurrent
+        # SendPolicyInstructions calls: gRPC serves them on separate worker threads, so without
+        # it two clients racing at startup both observe `self.policy is None` and each load a
+        # full copy of the weights.
+        self._policy_lock = threading.Lock()
+        self._loaded_policy_key: tuple | None = None
+
     @property
     def running(self):
         return not self.shutdown_event.is_set()
@@ -146,27 +155,53 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.lerobot_features = policy_specs.lerobot_features
         self.actions_per_chunk = policy_specs.actions_per_chunk
 
-        policy_class = get_policy_class(self.policy_type)
-
-        start = time.perf_counter()
-        self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
-        self.policy.to(self.device)
-
-        # Load preprocessor and postprocessor, overriding device to match requested device
-        device_override = {"device": self.device}
-        self.preprocessor, self.postprocessor = make_pre_post_processors(
-            self.policy.config,
-            pretrained_path=policy_specs.pretrained_name_or_path,
-            preprocessor_overrides={
-                "device_processor": device_override,
-                "rename_observations_processor": {"rename_map": policy_specs.rename_map},
-            },
-            postprocessor_overrides={"device_processor": device_override},
+        # Only these determine the weights and the processor pipelines. The task travels with
+        # every observation, and actions_per_chunk is applied as a slice at inference time, so a
+        # client changing either of those reuses the policy that is already resident.
+        policy_key = (
+            policy_specs.policy_type,
+            str(policy_specs.pretrained_name_or_path),
+            policy_specs.device,
+            tuple(sorted((policy_specs.rename_map or {}).items())),
         )
 
-        end = time.perf_counter()
+        with self._policy_lock:
+            if self.policy is not None and policy_key == self._loaded_policy_key:
+                self.logger.info(f"Policy already resident on {self.device}; reusing weights (no reload)")
+                if hasattr(self.policy, "reset"):
+                    self.policy.reset()  # drop per-episode state left over from the previous client
+            else:
+                policy_class = get_policy_class(self.policy_type)
 
-        self.logger.info(f"Time taken to put policy on {self.device}: {end - start:.4f} seconds")
+                # Drop the outgoing policy before loading the new one: these checkpoints are tens
+                # of GB, and holding two copies at once exhausts host RAM (and the device).
+                self._loaded_policy_key = None
+                self.policy = self.preprocessor = self.postprocessor = None
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                start = time.perf_counter()
+                policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
+                policy.to(self.device)
+
+                # Load preprocessor and postprocessor, overriding device to match requested device
+                device_override = {"device": self.device}
+                self.preprocessor, self.postprocessor = make_pre_post_processors(
+                    policy.config,
+                    pretrained_path=policy_specs.pretrained_name_or_path,
+                    preprocessor_overrides={
+                        "device_processor": device_override,
+                        "rename_observations_processor": {"rename_map": policy_specs.rename_map},
+                    },
+                    postprocessor_overrides={"device_processor": device_override},
+                )
+
+                end = time.perf_counter()
+                self.policy = policy
+                self._loaded_policy_key = policy_key
+
+                self.logger.info(f"Time taken to put policy on {self.device}: {end - start:.4f} seconds")
 
         return services_pb2.Empty()
 

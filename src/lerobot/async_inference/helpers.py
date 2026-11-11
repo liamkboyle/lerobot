@@ -141,6 +141,25 @@ def make_lerobot_observation(
     return build_dataset_frame(lerobot_features, robot_obs, prefix=OBS_STR)
 
 
+# Cameras already reported as unused, so the warning does not repeat at every inference step.
+_UNUSED_CAMERAS_WARNED: set[tuple[str, ...]] = set()
+
+
+def _warn_once_about_unused_cameras(
+    image_keys: list[str], policy_image_features: dict[str, PolicyFeature]
+) -> None:
+    """Warn (once per camera set) about robot cameras the policy does not consume."""
+    unused = tuple(sorted(set(image_keys) - set(policy_image_features)))
+    if not unused or unused in _UNUSED_CAMERAS_WARNED:
+        return
+
+    _UNUSED_CAMERAS_WARNED.add(unused)
+    logging.warning(
+        f"Camera(s) {list(unused)} are not inputs of this policy and will not be sent to it. "
+        f"Policy cameras: {sorted(policy_image_features)}"
+    )
+
+
 def prepare_raw_observation(
     robot_obs: RawObservation,
     lerobot_features: dict[str, dict],
@@ -154,16 +173,30 @@ def prepare_raw_observation(
 
     # 2. Greps all observation.images.<> keys
     image_keys = list(filter(is_image_key, lerobot_obs))
+
+    # The robot's camera set need not match the policy's. Cameras the policy was not trained on are
+    # dropped (they are still recorded and displayed client-side), but a camera the policy expects
+    # and the robot does not provide is fatal: the policy would silently run on a missing input.
+    missing_image_keys = sorted(set(policy_image_features) - set(image_keys))
+    if missing_image_keys:
+        raise ValueError(
+            f"Robot does not provide the camera(s) {missing_image_keys} expected by the policy. "
+            f"Policy cameras: {sorted(policy_image_features)} | Robot cameras: {sorted(image_keys)}. "
+            "Rename the robot's cameras to match the ones the policy was trained on."
+        )
+
+    _warn_once_about_unused_cameras(image_keys, policy_image_features)
+    image_keys = [key for key in image_keys if key in policy_image_features]
+
     # state's shape is expected as (B, state_dim)
     state_dict = {OBS_STATE: extract_state_from_raw_observation(lerobot_obs)}
-    image_dict = {
-        image_k: extract_images_from_raw_observation(lerobot_obs, image_k) for image_k in image_keys
-    }
 
     # Turns the image features to (C, H, W) with H, W matching the policy image features.
     # This reduces the resolution of the images
     image_dict = {
-        key: resize_robot_observation_image(torch.tensor(lerobot_obs[key]), policy_image_features[key].shape)
+        key: resize_robot_observation_image(
+            extract_images_from_raw_observation(lerobot_obs, key), policy_image_features[key].shape
+        )
         for key in image_keys
     }
 
