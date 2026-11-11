@@ -18,7 +18,6 @@ from dataclasses import dataclass, field
 import torch
 
 from lerobot.robots.config import RobotConfig
-from lerobot.utils.visualization_utils import VISUALIZATION_MODES
 
 from .constants import (
     DEFAULT_FPS,
@@ -149,40 +148,6 @@ class RobotClientConfig:
         default=False, metadata={"help": "Visualize the action queue size"}
     )
 
-    # Live visualization of the control loop (cameras, joint states, performed actions)
-    display_data: bool = field(
-        default=False, metadata={"help": "Stream observations and performed actions to a viewer"}
-    )
-    # Visualization backend used when display_data is set: "rerun" or "foxglove".
-    display_mode: str = field(
-        default="rerun",
-        metadata={
-            "help": f"Visualization backend used when display_data is set. Options: {list(VISUALIZATION_MODES)}"
-        },
-    )
-    # For "rerun": IP of a remote viewer to send to. For "foxglove": interface to bind the
-    # WebSocket server to (127.0.0.1 for local only, 0.0.0.0 for all interfaces).
-    display_ip: str | None = field(
-        default=None,
-        metadata={
-            "help": "For 'rerun': IP of a remote viewer to send to. For 'foxglove': interface to bind the "
-            "WebSocket server to (127.0.0.1 for local only, 0.0.0.0 for all interfaces)"
-        },
-    )
-    # For "rerun": port of the remote viewer. For "foxglove": port to bind the WebSocket server to.
-    display_port: int | None = field(
-        default=None,
-        metadata={
-            "help": "For 'rerun': port of the remote viewer. For 'foxglove': port to bind the WebSocket "
-            "server to"
-        },
-    )
-    # Whether to display compressed (JPEG) images instead of raw frames
-    display_compressed_images: bool = field(
-        default=False,
-        metadata={"help": "Display JPEG-compressed images instead of raw frames, to save bandwidth"},
-    )
-
     @property
     def environment_dt(self) -> float:
         """Environment time step, in seconds"""
@@ -213,16 +178,6 @@ class RobotClientConfig:
 
         if self.actions_per_chunk <= 0:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
-
-        if self.display_data and self.display_mode not in VISUALIZATION_MODES:
-            raise ValueError(
-                f"display_mode must be one of {list(VISUALIZATION_MODES)}, got {self.display_mode}"
-            )
-
-        # Streaming to a remote viewer over the network: compress frames, as the raw ones saturate
-        # the link. Mirrors `lerobot-teleoperate`.
-        if self.display_data and self.display_ip is not None and self.display_port is not None:
-            self.display_compressed_images = True
 
         self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
 
